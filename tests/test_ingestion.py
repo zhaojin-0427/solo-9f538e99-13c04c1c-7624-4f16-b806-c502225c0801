@@ -266,6 +266,8 @@ def test_failure_in_one_station_does_not_change_other_station(client):
             "cumulative_mm": 0.0,
             "is_reset": False,
             "is_retracted": False,
+            "archived": False,
+            "archived_at": None,
         }
     ]
 

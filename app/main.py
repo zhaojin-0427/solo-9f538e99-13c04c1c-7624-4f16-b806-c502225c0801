@@ -15,19 +15,24 @@ from fastapi.responses import JSONResponse
 
 from . import __version__
 from .db import Database
-from .errors import BatchRejected
+from .errors import ArchiveRejected, BatchRejected
 from .models import (
+    ArchiveRequest,
+    ArchiveResponse,
+    ArchiveStatusResponse,
     DailyRainfallResponse,
     ErrorDetail,
     ErrorResponse,
     HealthResponse,
-    ObservationUploadResult,
     ObservationsUpload,
+    ObservationUploadResult,
     StationObservationsResponse,
     UploadedObservation,
     UploadResponse,
 )
 from .rainfall import (
+    archive_station,
+    get_archive_status,
     get_daily_rainfall,
     ingest_batch,
     list_station_observations,
@@ -87,6 +92,24 @@ def create_app(database: Database | None = None) -> FastAPI:
                     message=(
                         "The batch was rejected and no observations or daily "
                         "results were changed."
+                    ),
+                    details=exc.violations,
+                )
+            ).model_dump(mode="json"),
+        )
+
+    @app.exception_handler(ArchiveRejected)
+    async def _archive_rejected_handler(
+        _: Request, exc: ArchiveRejected
+    ) -> JSONResponse:
+        return JSONResponse(
+            status_code=status.HTTP_409_CONFLICT,
+            content=ErrorResponse(
+                error=ErrorDetail(
+                    code="archive_rejected",
+                    message=(
+                        "The archive request was rejected and no observations "
+                        "or daily results were changed."
                     ),
                     details=exc.violations,
                 )
@@ -232,6 +255,48 @@ def create_app(database: Database | None = None) -> FastAPI:
             station_id=station_id,
             observations=[UploadedObservation(**row) for row in rows],
         )
+
+    @app.post(
+        "/stations/{station_id}/archive",
+        response_model=ArchiveResponse,
+        status_code=status.HTTP_200_OK,
+        tags=["archiving"],
+        summary="Archive observations of a station before a UTC cutoff day",
+    )
+    def archive_station_observations(
+        payload: ArchiveRequest,
+        station_id: str = Path(min_length=1, max_length=100),
+        database: Database = Depends(get_db),
+    ) -> ArchiveResponse:
+        """Move pre-cutoff observations to the archive.
+
+        Observations whose UTC day is strictly before ``cutoff_date`` leave
+        the active set, except for the last non-retracted reading, which is
+        retained as the baseline for later differences.  Existing daily
+        results are preserved unchanged.  The cutoff can only move forward.
+        """
+
+        with database.connection() as conn:
+            outcome = archive_station(conn, station_id, payload.cutoff_date)
+
+        return ArchiveResponse(**outcome)
+
+    @app.get(
+        "/stations/{station_id}/archive",
+        response_model=ArchiveStatusResponse,
+        tags=["archiving"],
+        summary="Show a station's archive cutoff and archived observation count",
+    )
+    def station_archive_status(
+        station_id: str = Path(min_length=1, max_length=100),
+        database: Database = Depends(get_db),
+    ) -> ArchiveStatusResponse:
+        """Report the current cutoff, or null when the station was never archived."""
+
+        with database.connection() as conn:
+            outcome = get_archive_status(conn, station_id)
+
+        return ArchiveStatusResponse(**outcome)
 
     return app
 

@@ -28,7 +28,7 @@ from decimal import Decimal, InvalidOperation
 from typing import Any, Iterable
 
 from .db import write_transaction
-from .errors import BatchRejected, violation
+from .errors import ArchiveRejected, BatchRejected, violation
 from .models import ObservationIn
 
 UNCHANGED = "unchanged"
@@ -124,6 +124,16 @@ def _fetch_station_observations(
     return [_row_to_state(row) for row in rows]
 
 
+def _get_cutoff_day(conn: sqlite3.Connection, station_id: str) -> date | None:
+    """Return the station's current UTC archive cutoff day, if archived."""
+
+    row = conn.execute(
+        "SELECT cutoff_day FROM archive_cutoffs WHERE station_id = ?",
+        (station_id,),
+    ).fetchone()
+    return date.fromisoformat(row["cutoff_day"]) if row is not None else None
+
+
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="microseconds")
 
@@ -181,6 +191,65 @@ def _resolve_batch_duplicates(
             )
 
     return effective, superseded, violations
+
+
+def _enforce_archive_boundaries(
+    conn: sqlite3.Connection, observations: Iterable[ObservationIn]
+) -> None:
+    """Reject a batch that touches archived data.
+
+    Two cases reject the whole batch (including observations for other
+    stations):
+
+    * an observation id already lives in the archive -- its revision is frozen
+      and the id cannot be re-created or superseded;
+    * an observed instant is strictly before the station's cutoff day -- no
+      active reading may ever be inserted or rewritten inside archived time.
+
+    Runs inside the batch write transaction, before any row is changed, so a
+    rejection leaves no partial state.
+    """
+
+    observations = list(observations)
+    station_ids = {item.station_id for item in observations}
+    cutoffs = {
+        station_id: _get_cutoff_day(conn, station_id)
+        for station_id in station_ids
+    }
+
+    violations: list[dict[str, Any]] = []
+    for obs in observations:
+        archived = conn.execute(
+            "SELECT 1 FROM archived_observations "
+            "WHERE station_id = ? AND observation_id = ?",
+            (obs.station_id, obs.observation_id),
+        ).fetchone()
+        if archived is not None:
+            violations.append(
+                violation(
+                    "observation_archived",
+                    "the observation has been archived and can no longer be modified",
+                    station_id=obs.station_id,
+                    observation_id=obs.observation_id,
+                )
+            )
+            continue
+
+        cutoff = cutoffs[obs.station_id]
+        if cutoff is not None and utc_day(obs.observed_at) < cutoff:
+            violations.append(
+                violation(
+                    "observed_before_archive_cutoff",
+                    "the observed instant is earlier than the station archive cutoff",
+                    station_id=obs.station_id,
+                    observation_id=obs.observation_id,
+                    observed_at=canonical_time(obs.observed_at),
+                    cutoff_date=cutoff.isoformat(),
+                )
+            )
+
+    if violations:
+        raise BatchRejected(violations)
 
 
 def _apply_batch(
@@ -423,6 +492,11 @@ def _refresh_daily_results(conn: sqlite3.Connection, dirty: set[str]) -> set[dat
     affected_days: set[date] = set()
 
     for station_id in sorted(dirty):
+        # Daily results strictly before the archive cutoff belong to the
+        # archived period and must remain byte-for-byte identical: the active
+        # set no longer contains the readings that produced them, so they are
+        # neither recomputed nor deleted here.
+        cutoff_day = _get_cutoff_day(conn, station_id)
         observations = _fetch_station_observations(conn, station_id)
         results = _calculate_station(observations)
 
@@ -439,6 +513,8 @@ def _refresh_daily_results(conn: sqlite3.Connection, dirty: set[str]) -> set[dat
         }
 
         for day in set(existing) | set(results):
+            if cutoff_day is not None and day < cutoff_day:
+                continue
             if day in results:
                 total, ids = results[day]
                 canonical_total = decimal_to_string(total)
@@ -481,6 +557,9 @@ def ingest_batch(
 
     observations = list(observations)
     with write_transaction(conn):
+        # Boundary checks precede every write so an offending batch (including
+        # its valid observations for other stations) is rejected wholesale.
+        _enforce_archive_boundaries(conn, observations)
         results, dirty = _apply_batch(conn, observations)
         _validate_station_state(conn, dirty)
         affected_days = _refresh_daily_results(conn, dirty)
@@ -515,10 +594,28 @@ def get_daily_rainfall(
 def list_station_observations(
     conn: sqlite3.Connection, station_id: str
 ) -> list[dict[str, Any]]:
+    """Return every observation for a station, active and archived.
+
+    Archived rows carry ``archived=True`` and their archival timestamp so the
+    historical trail stays queryable through the same endpoint as active data.
+    """
+
     rows = conn.execute(
-        "SELECT * FROM observations WHERE station_id = ? "
-        "ORDER BY observed_at, observation_id",
-        (station_id,),
+        """
+        SELECT station_id, observation_id, revision, observed_at,
+               observed_day, cumulative_mm, is_reset, is_retracted,
+               updated_at, NULL AS archived_at
+          FROM observations
+         WHERE station_id = ?
+        UNION ALL
+        SELECT station_id, observation_id, revision, observed_at,
+               observed_day, cumulative_mm, is_reset, is_retracted,
+               updated_at, archived_at
+          FROM archived_observations
+         WHERE station_id = ?
+         ORDER BY observed_at, observation_id
+        """,
+        (station_id, station_id),
     ).fetchall()
     return [
         {
@@ -529,6 +626,164 @@ def list_station_observations(
             "cumulative_mm": float(Decimal(row["cumulative_mm"])),
             "is_reset": bool(row["is_reset"]),
             "is_retracted": bool(row["is_retracted"]),
+            "archived": row["archived_at"] is not None,
+            "archived_at": (
+                datetime.fromisoformat(row["archived_at"])
+                if row["archived_at"] is not None
+                else None
+            ),
         }
         for row in rows
     ]
+
+
+def archive_station(
+    conn: sqlite3.Connection, station_id: str, cutoff_day: date
+) -> dict[str, Any]:
+    """Move a station's pre-cutoff observations into the archive.
+
+    The last non-retracted reading before the cutoff stays in the active set
+    as the baseline for post-cutoff differences; every other active row whose
+    UTC day is strictly before the cutoff is copied to ``archived_observations``
+    and deleted.  Daily results are left untouched -- they already cover the
+    archived period and the boundary guard keeps them frozen.
+
+    The cutoff only moves forward.  Everything happens in one immediate
+    transaction, so a failure leaves neither a partial migration nor a changed
+    cutoff.
+    """
+
+    with write_transaction(conn):
+        previous = _get_cutoff_day(conn, station_id)
+        if previous is not None and cutoff_day <= previous:
+            raise ArchiveRejected(
+                [
+                    violation(
+                        "cutoff_not_advanced",
+                        "the archive cutoff day can only move forward",
+                        station_id=station_id,
+                        cutoff_date=cutoff_day.isoformat(),
+                        previous_cutoff_date=previous.isoformat(),
+                    )
+                ]
+            )
+
+        now = _now()
+
+        # Anchor: the latest pre-cutoff non-retracted reading.  Keeping it
+        # active preserves the consecutive-pair difference rule across the
+        # boundary, including reset baselines.
+        anchor_row = conn.execute(
+            """
+            SELECT * FROM observations
+             WHERE station_id = ?
+               AND observed_day < ?
+               AND is_retracted = 0
+             ORDER BY observed_at DESC, observation_id DESC
+             LIMIT 1
+            """,
+            (station_id, cutoff_day.isoformat()),
+        ).fetchone()
+        anchor_id = anchor_row["observation_id"] if anchor_row is not None else None
+
+        archived_rows = conn.execute(
+            """
+            SELECT * FROM observations
+             WHERE station_id = ?
+               AND observed_day < ?
+               AND (? IS NULL OR observation_id != ?)
+             ORDER BY observed_at, observation_id
+            """,
+            (station_id, cutoff_day.isoformat(), anchor_id, anchor_id),
+        ).fetchall()
+
+        for row in archived_rows:
+            conn.execute(
+                """
+                INSERT INTO archived_observations (
+                    station_id, observation_id, revision, observed_at,
+                    observed_day, cumulative_mm, is_reset, is_retracted,
+                    updated_at, archived_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    row["station_id"],
+                    row["observation_id"],
+                    row["revision"],
+                    row["observed_at"],
+                    row["observed_day"],
+                    row["cumulative_mm"],
+                    row["is_reset"],
+                    row["is_retracted"],
+                    row["updated_at"],
+                    now,
+                ),
+            )
+            conn.execute(
+                "DELETE FROM observations "
+                "WHERE station_id = ? AND observation_id = ?",
+                (row["station_id"], row["observation_id"]),
+            )
+
+        conn.execute(
+            """
+            INSERT INTO archive_cutoffs (station_id, cutoff_day, updated_at)
+            VALUES (?, ?, ?)
+            ON CONFLICT (station_id) DO UPDATE SET
+                cutoff_day = excluded.cutoff_day,
+                updated_at = excluded.updated_at
+            """,
+            (station_id, cutoff_day.isoformat(), now),
+        )
+
+    return {
+        "station_id": station_id,
+        "cutoff_date": cutoff_day,
+        "previous_cutoff_date": previous,
+        "archived": len(archived_rows),
+        "retained_observation_id": anchor_id,
+        "updated_at": datetime.fromisoformat(now),
+    }
+
+
+def get_archive_status(
+    conn: sqlite3.Connection, station_id: str
+) -> dict[str, Any]:
+    """Return a station's cutoff and the counts behind it."""
+
+    cutoff = _get_cutoff_day(conn, station_id)
+    cutoff_row = conn.execute(
+        "SELECT updated_at FROM archive_cutoffs WHERE station_id = ?",
+        (station_id,),
+    ).fetchone()
+    archived_count = conn.execute(
+        "SELECT COUNT(*) AS n FROM archived_observations WHERE station_id = ?",
+        (station_id,),
+    ).fetchone()["n"]
+
+    anchor_id = None
+    if cutoff is not None:
+        anchor_row = conn.execute(
+            """
+            SELECT observation_id FROM observations
+             WHERE station_id = ?
+               AND observed_day < ?
+               AND is_retracted = 0
+             ORDER BY observed_at DESC, observation_id DESC
+             LIMIT 1
+            """,
+            (station_id, cutoff.isoformat()),
+        ).fetchone()
+        anchor_id = anchor_row["observation_id"] if anchor_row is not None else None
+
+    return {
+        "station_id": station_id,
+        "cutoff_date": cutoff,
+        "archived_count": archived_count,
+        "retained_observation_id": anchor_id,
+        "updated_at": (
+            datetime.fromisoformat(cutoff_row["updated_at"])
+            if cutoff_row is not None
+            else None
+        ),
+    }

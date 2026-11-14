@@ -17,6 +17,18 @@ class BatchRejected(Exception):
         super().__init__(f"batch rejected with {len(violations)} violation(s)")
 
 
+class ArchiveRejected(Exception):
+    """Raised when an archive request cannot be applied.
+
+    The cutoff may only move forward, so an equal or earlier cutoff is a
+    conflict.  Nothing is moved or rewritten when this is raised.
+    """
+
+    def __init__(self, violations: list[dict[str, Any]]) -> None:
+        self.violations = violations
+        super().__init__(f"archive rejected with {len(violations)} violation(s)")
+
+
 def violation(code: str, message: str, **context: Any) -> dict[str, Any]:
     payload: dict[str, Any] = {"code": code, "message": message}
     payload.update({key: value for key, value in context.items() if value is not None})

@@ -39,6 +39,34 @@ CREATE TABLE IF NOT EXISTS daily_rainfall (
     updated_at       TEXT NOT NULL,
     PRIMARY KEY (station_id, day)
 );
+
+-- Observations moved out of the active set by archiving.  The full payload is
+-- retained so historical observation queries stay traceable; rows never move
+-- back because a station's cutoff day can only advance.
+CREATE TABLE IF NOT EXISTS archived_observations (
+    station_id       TEXT    NOT NULL,
+    observation_id   TEXT    NOT NULL,
+    revision         INTEGER NOT NULL CHECK (revision >= 1),
+    observed_at      TEXT    NOT NULL,
+    observed_day     TEXT    NOT NULL,
+    cumulative_mm    TEXT    NOT NULL,
+    is_reset         INTEGER NOT NULL CHECK (is_reset IN (0, 1)),
+    is_retracted     INTEGER NOT NULL CHECK (is_retracted IN (0, 1)),
+    updated_at       TEXT    NOT NULL,
+    archived_at      TEXT    NOT NULL,
+    PRIMARY KEY (station_id, observation_id)
+);
+
+CREATE INDEX IF NOT EXISTS archived_observations_by_station_time
+    ON archived_observations (station_id, observed_at, observed_day);
+
+-- Per-station UTC cutoff day (YYYY-MM-DD).  Observations strictly before this
+-- day belong to the archive; the day itself stays open for new uploads.
+CREATE TABLE IF NOT EXISTS archive_cutoffs (
+    station_id       TEXT    NOT NULL PRIMARY KEY,
+    cutoff_day       TEXT    NOT NULL,
+    updated_at       TEXT    NOT NULL
+);
 """
 
 DEFAULT_DATABASE_PATH = "./data/rainfall.db"

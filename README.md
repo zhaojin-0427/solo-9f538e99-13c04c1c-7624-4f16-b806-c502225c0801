@@ -124,7 +124,59 @@ curl -sS http://localhost:8000/stations/S1/daily/2026-11-01
 
 ### `GET /stations/{station_id}/observations` — 观测当前状态
 
-返回该站点每个观测的当前有效修订，用于追查来源。
+返回该站点每个观测的当前有效修订，用于追查来源。归档后此接口同时返回活动
+观测和归档观测：归档记录带 `"archived": true` 与 `archived_at`，其完整载荷
+（修订、时刻、累计值、复位/撤回标记）原样保留。
+
+### `POST /stations/{station_id}/archive` — 归档旧观测
+
+按站点和 UTC 截止日，把截止日**之前**（UTC 日严格早于 `cutoff_date`）的观测
+移出活动集。截止日当天仍可正常上传。
+
+```bash
+curl -sS -X POST http://localhost:8000/stations/S1/archive \
+  -H 'content-type: application/json' \
+  -d '{"cutoff_date": "2026-11-02"}'
+```
+
+成功返回（HTTP 200）：
+
+```json
+{
+  "station_id": "S1",
+  "cutoff_date": "2026-11-02",
+  "previous_cutoff_date": null,
+  "archived": 128,
+  "retained_observation_id": "O999",
+  "updated_at": "2026-11-14T08:00:00.000000Z"
+}
+```
+
+- 截止日前最后一条**未撤回**读数（`retained_observation_id`）保留在活动集，
+  作为截止日后相邻差额的基准；复位规则、差额归属规则照旧。其余截止日前观测
+  整行复制到归档表后从活动表删除。
+- 既有日雨量结果保持原样：截止日前的日报被冻结，后续上传触发重算时既不会
+  重算也不会删除这些行。
+- 截止日只能向后推进。相同或更早的截止日返回 HTTP 409
+  （`archive_rejected` / `cutoff_not_advanced`），不移动任何数据。
+- 推进截止日时，上一次保留的基准会按新截止日重新评估并归档。
+
+`GET /stations/{station_id}/archive` 返回当前截止日、归档观测数和保留基准；
+从未归档的站点 `cutoff_date` 为 `null`。
+
+### 归档后的上传边界
+
+上传批次只要触及归档范围，整批拒绝（HTTP 409，含其它站点的正常数据也不
+生效），有两类违规：
+
+| 违规 code | 触发条件 |
+| --- | --- |
+| `observed_before_archive_cutoff` | 任一观测的 UTC 时刻早于所属站点截止日 |
+| `observation_archived` | 任一观测 ID 已在归档表中（修订被冻结，不可重建或覆盖） |
+
+归档与上传都以 `BEGIN IMMEDIATE` 开启同一个写事务，按提交顺序串行判定：先
+提交者建立的边界对后提交者立即生效。任一失败都整体回滚，不会留下部分迁移
+或被改写的日报。
 
 ### `GET /health`
 
@@ -169,7 +221,16 @@ curl -sS http://localhost:8000/stations/S1/daily/2026-11-01
 - 更正读数的时间（可能跨日移动）或累计值；
 - 撤回读数（其前后两个读数直接相邻）。
 
-重算后不再有任何贡献读数的日期会被删除，查询时表现为 0 mm。
+重算后不再有任何贡献读数的日期会被删除，查询时表现为 0 mm。归档冻结日不
+受此规则影响：截止日前的日报永久保留。
+
+### 归档
+
+- 归档是移动而非删除：`archived_observations` 保留完整观测载荷，
+  `archive_cutoffs` 记录每站单调推进的 UTC 截止日。
+- 锚点保留使跨截止日的差额不断档：活动集里最后一条截止日前未撤回读数与
+  截止日后读数仍然相邻，现有计算引擎无需感知归档。
+- 截止日前日报被冻结：上传后的全站重算会跳过严格早于截止日的行。
 
 ## 项目结构
 
@@ -177,9 +238,9 @@ curl -sS http://localhost:8000/stations/S1/daily/2026-11-01
 app/
   main.py       FastAPI 应用、错误处理、路由
   models.py     Pydantic 请求/响应模型与输入别名
-  rainfall.py   校验、修订合并、日雨量计算、事务
+  rainfall.py   校验、修订合并、日雨量计算、归档、事务
   db.py         SQLite 连接与 schema
-  errors.py     批次拒绝异常
+  errors.py     批次/归档拒绝异常
 tests/          端到端测试（FastAPI TestClient）
 Dockerfile
 docker-compose.yml
@@ -195,8 +256,9 @@ python3 -m pytest
 ## 设计取舍
 
 - **整批原子性**：先 `BEGIN IMMEDIATE` 再读校验，避免两个并发上传基于同一旧
-  状态各自通过；任一违规即整体回滚。
+  状态各自通过；任一违规即整体回滚。归档走同一把写锁，与上传按提交顺序
+  串行，不存在部分迁移。
 - **按站点重算**：一次上传后重算该站所有日结果。数据量远小于查询量，换来
   迟到、更正、撤回、跨日移动、复位边界变化等情况的一致结果，无需维护增量
-  依赖。
+  依赖。归档站只重算截止日及以后的行，冻结历史不被活动集变化影响。
 - **金额用十进制字符串存储**：重复上传的内容比对与日汇总都精确可复现。

@@ -120,6 +120,11 @@ class UploadedObservation(BaseModel):
     cumulative_mm: float
     is_reset: bool
     is_retracted: bool
+    # False for an active observation, True once it has been archived.  The
+    # station observation endpoint merges both sets for traceability.
+    archived: bool = False
+    # Present only for archived rows.
+    archived_at: datetime | None = None
 
 
 class ObservationUploadResult(BaseModel):
@@ -149,6 +154,38 @@ class DailyRainfallResponse(BaseModel):
 class StationObservationsResponse(BaseModel):
     station_id: str
     observations: list[UploadedObservation]
+
+
+class ArchiveRequest(BaseModel):
+    """Payload for advancing a station's UTC archive cutoff day."""
+
+    model_config = ConfigDict(extra="forbid", populate_by_name=True)
+
+    cutoff_date: date = Field(
+        validation_alias=AliasChoices(
+            "cutoff_date", "cutoffDate", "cutoff_day", "cutoffDay", "date"
+        ),
+        description="UTC day before which observations are archived",
+    )
+
+
+class ArchiveResponse(BaseModel):
+    station_id: str
+    cutoff_date: date
+    previous_cutoff_date: date | None = None
+    archived: int
+    # The last pre-cutoff non-retracted reading, kept active as the baseline
+    # for differences after the cutoff.  Null when no such reading exists.
+    retained_observation_id: str | None = None
+    updated_at: datetime
+
+
+class ArchiveStatusResponse(BaseModel):
+    station_id: str
+    cutoff_date: date | None = None
+    archived_count: int
+    retained_observation_id: str | None = None
+    updated_at: datetime | None = None
 
 
 class HealthResponse(BaseModel):
